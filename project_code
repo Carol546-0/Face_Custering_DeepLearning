@@ -1,0 +1,521 @@
+import os
+
+files_to_delete = [
+    "/content/cache/arcface_embeddings.npy",
+    "/content/cache/arcface_true_labels.npy"
+]
+
+for file_path in files_to_delete:
+    if os.path.exists(file_path):
+        os.remove(file_path)
+        print(f"Deleted: {file_path}")
+    else:
+        print(f"Not found: {file_path}")
+!pip install timm mtcnn --quiet
+# ============================================================
+# FACE CLUSTERING PROJECT - COLAB VERSION
+# ArcFace / InsightFace instead of EfficientNet
+# ============================================================
+
+# ================================
+# 1. Install libraries
+# ================================
+!pip install insightface onnxruntime-gpu -q
+
+
+# ================================
+# 2. Mount Google Drive
+# ================================
+from google.colab import drive
+drive.mount('/content/drive')
+
+
+# ================================
+# 3. Extract dataset ZIP
+# ================================
+import os
+import zipfile
+from pathlib import Path
+
+zip_path = "/content/drive/MyDrive/DL_Project/archive.zip"
+extract_path = "/content/105_classes_pins_dataset"
+
+if not os.path.exists(extract_path):
+    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+        zip_ref.extractall(extract_path)
+    print("Dataset extracted.")
+else:
+    print("Dataset already extracted.")
+
+
+# ================================
+# 4. Imports
+# ================================
+import gc
+import warnings
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+from PIL import Image
+from tqdm import tqdm
+
+import torch
+
+from insightface.app import FaceAnalysis
+
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import LabelEncoder, normalize
+from sklearn.cluster import KMeans, AgglomerativeClustering
+from sklearn.metrics import (
+    adjusted_rand_score,
+    normalized_mutual_info_score,
+    homogeneity_score,
+    completeness_score,
+    confusion_matrix
+)
+from sklearn.manifold import TSNE
+
+warnings.filterwarnings("ignore")
+
+
+# ================================
+# 5. Configuration
+# ================================
+DATA_ROOT = Path("/content/105_classes_pins_dataset")
+
+IMG_SIZE = 224
+BATCH_SIZE = 32
+N_CLUSTERS = 105
+PCA_DIMS = 50
+RANDOM_SEED = 42
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+CACHE_DIR = Path("/content/cache")
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+EMB_PATH = CACHE_DIR / "arcface_embeddings.npy"
+LBL_PATH = CACHE_DIR / "arcface_true_labels.npy"
+
+print("Device:", DEVICE)
+print("Data root:", DATA_ROOT)
+
+
+# ================================
+# 6. Find dataset folders automatically
+# ================================
+folders = sorted([f for f in DATA_ROOT.iterdir() if f.is_dir()])
+
+if len(folders) == 1:
+    inner_folders = sorted([f for f in folders[0].iterdir() if f.is_dir()])
+    if len(inner_folders) > 1:
+        DATA_ROOT = folders[0]
+        folders = inner_folders
+
+print("Final DATA_ROOT:", DATA_ROOT)
+print("Total classes found:", len(folders))
+print("First folders:", [f.name for f in folders[:5]])
+
+
+# ================================
+# 7. Explore sample images
+# ================================
+def explore_dataset(folders, n_people=5, n_imgs=5):
+    fig, axes = plt.subplots(n_people, n_imgs, figsize=(n_imgs * 2.5, n_people * 2.5))
+
+    for row, folder in enumerate(folders[:n_people]):
+        images = sorted(folder.glob("*.jpg"))[:n_imgs]
+        name = folder.name.replace("pins_", "")
+
+        for col in range(n_imgs):
+            ax = axes[row][col]
+            ax.axis("off")
+
+            if col < len(images):
+                img = Image.open(images[col]).convert("RGB")
+                ax.imshow(img)
+
+            if col == 0:
+                ax.set_ylabel(name, rotation=0, labelpad=80, va="center")
+
+    plt.tight_layout()
+    plt.savefig("/content/exploration.png", dpi=120, bbox_inches="tight")
+    plt.show()
+
+explore_dataset(folders)
+
+
+# ================================
+# 8. Build image dataframe
+# ================================
+records = []
+
+for folder in folders:
+    label = folder.name.replace("pins_", "")
+
+    for ext in ["*.jpg", "*.jpeg", "*.png"]:
+        for img_path in folder.glob(ext):
+            records.append({
+                "path": str(img_path),
+                "label": label
+            })
+
+df = pd.DataFrame(records)
+
+le = LabelEncoder()
+df["label_id"] = le.fit_transform(df["label"])
+
+print("Total images:", len(df))
+print("Total classes:", df["label"].nunique())
+print(df["label"].value_counts().describe())
+
+df.to_csv("/content/image_index.csv", index=False)
+
+
+# ================================
+# 9. Load InsightFace ArcFace model
+# ================================
+print("Loading InsightFace ArcFace model...")
+
+providers = ["CUDAExecutionProvider", "CPUExecutionProvider"] if DEVICE == "cuda" else ["CPUExecutionProvider"]
+
+app = FaceAnalysis(
+    name="buffalo_l",
+    providers=providers
+)
+
+app.prepare(
+    ctx_id=0 if DEVICE == "cuda" else -1,
+    det_size=(320, 320)
+)
+
+print("InsightFace model loaded successfully.")
+
+
+# ================================
+# 10. Extract ArcFace embedding for one image
+# ================================
+def get_arcface_embedding(path):
+    try:
+        img = Image.open(path).convert("RGB")
+        img = np.array(img)
+
+        # RGB to BGR because InsightFace expects BGR
+        img = img[:, :, ::-1]
+
+        faces = app.get(img)
+
+        if len(faces) == 0:
+            return None
+
+        # Choose largest detected face
+        face = max(
+            faces,
+            key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1])
+        )
+
+        emb = face.embedding.astype(np.float32)
+
+        # L2 normalize
+        emb = emb / np.linalg.norm(emb)
+
+        return emb
+
+    except Exception:
+        return None
+
+
+# ================================
+# 11. Extract all embeddings
+# ================================
+def extract_arcface_embeddings(df):
+    embeddings = []
+    labels = []
+    skipped = 0
+
+    paths = df["path"].tolist()
+    label_ids = df["label_id"].tolist()
+
+    for path, label in tqdm(
+        zip(paths, label_ids),
+        total=len(paths),
+        desc="Extracting ArcFace embeddings"
+    ):
+        emb = get_arcface_embedding(path)
+
+        if emb is None:
+            skipped += 1
+            continue
+
+        embeddings.append(emb)
+        labels.append(label)
+
+    embeddings = np.array(embeddings, dtype=np.float32)
+    labels = np.array(labels, dtype=np.int32)
+
+    print("Embeddings shape:", embeddings.shape)
+    print("Skipped images:", skipped)
+
+    return embeddings, labels
+
+
+# ================================
+# 12. Load cached embeddings or extract
+# ================================
+if EMB_PATH.exists() and LBL_PATH.exists():
+    print("Loading cached ArcFace embeddings...")
+    embeddings = np.load(EMB_PATH)
+    true_labels = np.load(LBL_PATH)
+else:
+    print("Extracting ArcFace embeddings...")
+    embeddings, true_labels = extract_arcface_embeddings(df)
+
+    np.save(EMB_PATH, embeddings)
+    np.save(LBL_PATH, true_labels)
+
+print("Embedding matrix:", embeddings.shape)
+print("True labels:", true_labels.shape)
+
+
+# ================================
+# 13. PCA
+# ================================
+print(f"Applying PCA: {embeddings.shape[1]} -> {PCA_DIMS}")
+
+pca = PCA(n_components=PCA_DIMS, random_state=RANDOM_SEED)
+emb_pca = pca.fit_transform(embeddings)
+
+explained = pca.explained_variance_ratio_.sum() * 100
+print(f"Variance retained: {explained:.2f}%")
+
+emb_pca_norm = normalize(emb_pca)
+
+
+# ================================
+# 14. Agglomerative Clustering
+# ================================
+print("Running Agglomerative Clustering...")
+
+agg = AgglomerativeClustering(
+    n_clusters=N_CLUSTERS,
+    metric="cosine",
+    linkage="average"
+)
+
+cluster_labels_agg = agg.fit_predict(emb_pca_norm)
+
+
+# ================================
+# 15. KMeans Clustering
+# ================================
+print("Running KMeans...")
+
+kmeans = KMeans(
+    n_clusters=N_CLUSTERS,
+    init="k-means++",
+    n_init=20,
+    max_iter=500,
+    random_state=RANDOM_SEED
+)
+
+cluster_labels_kmeans = kmeans.fit_predict(emb_pca_norm)
+
+
+# ================================
+# 16. Evaluation
+# ================================
+def evaluate_clustering(true_labels, cluster_labels, name):
+    ari = adjusted_rand_score(true_labels, cluster_labels)
+    nmi = normalized_mutual_info_score(true_labels, cluster_labels)
+    hom = homogeneity_score(true_labels, cluster_labels)
+    comp = completeness_score(true_labels, cluster_labels)
+
+    print("\n" + "=" * 50)
+    print(name)
+    print("=" * 50)
+    print(f"ARI          : {ari:.4f}")
+    print(f"NMI          : {nmi:.4f}")
+    print(f"Homogeneity  : {hom:.4f}")
+    print(f"Completeness : {comp:.4f}")
+
+    return {
+        "method": name,
+        "ARI": ari,
+        "NMI": nmi,
+        "Homogeneity": hom,
+        "Completeness": comp
+    }
+
+results = []
+
+results.append(evaluate_clustering(true_labels, cluster_labels_agg, "Agglomerative"))
+results.append(evaluate_clustering(true_labels, cluster_labels_kmeans, "KMeans"))
+
+results_df = pd.DataFrame(results)
+print(results_df)
+
+best_method = results_df.sort_values("ARI", ascending=False).iloc[0]["method"]
+
+if best_method == "Agglomerative":
+    cluster_labels = cluster_labels_agg
+else:
+    cluster_labels = cluster_labels_kmeans
+
+print("Best method:", best_method)
+
+
+# ================================
+# 17. Cluster purity
+# ================================
+def calculate_cluster_purity(true_labels, cluster_labels):
+    rows = []
+
+    for cid in np.unique(cluster_labels):
+        mask = cluster_labels == cid
+        labels_in_cluster = true_labels[mask]
+
+        dominant_label = np.bincount(labels_in_cluster).argmax()
+        purity = (labels_in_cluster == dominant_label).mean()
+
+        rows.append({
+            "cluster": int(cid),
+            "size": int(mask.sum()),
+            "dominant_person": le.inverse_transform([dominant_label])[0],
+            "purity": round(float(purity), 4)
+        })
+
+    return pd.DataFrame(rows).sort_values("purity", ascending=False)
+
+purity_df = calculate_cluster_purity(true_labels, cluster_labels)
+mean_purity = purity_df["purity"].mean()
+
+print("Mean cluster purity:", round(mean_purity, 4))
+
+print("\nTop 10 purest clusters:")
+print(purity_df.head(10).to_string(index=False))
+
+print("\nBottom 10 confused clusters:")
+print(purity_df.tail(10).to_string(index=False))
+
+purity_df.to_csv("/content/cluster_purity.csv", index=False)
+
+
+# ================================
+# 18. t-SNE visualization
+# ================================
+print("Computing t-SNE...")
+
+tsne = TSNE(
+    n_components=2,
+    perplexity=40,
+    max_iter=1000,
+    metric="cosine",
+    random_state=RANDOM_SEED,
+    verbose=1
+)
+
+emb_2d = tsne.fit_transform(emb_pca_norm)
+
+fig, axes = plt.subplots(1, 2, figsize=(20, 9))
+fig.suptitle("t-SNE Face Embeddings - ArcFace", fontsize=16)
+
+cmap = plt.cm.get_cmap("tab20", N_CLUSTERS)
+
+axes[0].scatter(
+    emb_2d[:, 0],
+    emb_2d[:, 1],
+    c=true_labels,
+    cmap=cmap,
+    s=6,
+    alpha=0.7
+)
+axes[0].set_title("Ground Truth Labels")
+axes[0].set_xticks([])
+axes[0].set_yticks([])
+
+axes[1].scatter(
+    emb_2d[:, 0],
+    emb_2d[:, 1],
+    c=cluster_labels,
+    cmap=cmap,
+    s=6,
+    alpha=0.7
+)
+axes[1].set_title(f"Predicted Clusters - {best_method}")
+axes[1].set_xticks([])
+axes[1].set_yticks([])
+
+plt.tight_layout()
+plt.savefig("/content/tsne_clusters_arcface.png", dpi=150, bbox_inches="tight")
+plt.show()
+
+
+# ================================
+# 19. Confusion matrix for top 20 people
+# ================================
+TOP_N = 20
+
+top_ids = pd.Series(true_labels).value_counts().head(TOP_N).index.tolist()
+mask = np.isin(true_labels, top_ids)
+
+cm = confusion_matrix(true_labels[mask], cluster_labels[mask])
+
+top_names = [le.inverse_transform([i])[0][:18] for i in top_ids]
+
+plt.figure(figsize=(16, 13))
+sns.heatmap(
+    cm,
+    cmap="YlOrRd",
+    yticklabels=top_names,
+    xticklabels=False,
+    linewidths=0.3,
+    linecolor="gray"
+)
+
+plt.xlabel("Predicted Cluster ID")
+plt.ylabel("True Person")
+plt.title(f"Confusion Matrix - Top {TOP_N} People - ArcFace")
+plt.tight_layout()
+plt.savefig("/content/confusion_matrix_arcface.png", dpi=120, bbox_inches="tight")
+plt.show()
+
+
+# ================================
+# 20. Save final results
+# ================================
+output_df = pd.DataFrame({
+    "true_label_id": true_labels,
+    "true_person": le.inverse_transform(true_labels),
+    "cluster": cluster_labels
+})
+
+output_df.to_csv("/content/final_cluster_results_arcface.csv", index=False)
+results_df.to_csv("/content/clustering_metrics_arcface.csv", index=False)
+
+print("\nSaved files:")
+print("/content/exploration.png")
+print("/content/tsne_clusters_arcface.png")
+print("/content/confusion_matrix_arcface.png")
+print("/content/final_cluster_results_arcface.csv")
+print("/content/clustering_metrics_arcface.csv")
+print("/content/cluster_purity.csv")
+
+
+# ================================
+# 21. Final summary
+# ================================
+print("\n" + "=" * 70)
+print("FINAL SUMMARY - ARCFACE")
+print("=" * 70)
+print(f"Images processed      : {len(embeddings)}")
+print(f"Classes               : {len(np.unique(true_labels))}")
+print(f"Embedding dim         : {embeddings.shape[1]}")
+print(f"PCA dimensions        : {PCA_DIMS}")
+print(f"Variance retained     : {explained:.2f}%")
+print(f"Clusters              : {N_CLUSTERS}")
+print(f"Best method           : {best_method}")
+print(f"Mean cluster purity   : {mean_purity:.4f}")
+print("=" * 70)
+!pip install insightface onnxruntime-gpu
